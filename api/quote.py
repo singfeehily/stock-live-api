@@ -9,7 +9,6 @@ class handler(BaseHTTPRequestHandler):
         query_components = parse_qs(urlparse(self.path).query)
         symbols_str = query_components.get("symbols", [""])[0]
         
-        # 接收前端傳來的新參數：interval
         interval = query_components.get("interval", [""])[0].lower()
         
         if not symbols_str:
@@ -22,7 +21,6 @@ class handler(BaseHTTPRequestHandler):
         results = {}
         symbols = symbols_str.split(',')
         
-        # 動態決定 Yahoo API 參數
         yf_interval = "1d"
         yf_range = "1d"
         
@@ -52,9 +50,10 @@ class handler(BaseHTTPRequestHandler):
                 chart_result = data['chart']['result'][0]
                 meta = chart_result['meta']
                 
-                # 1. 提取即時報價
+                # 1. 提取即時報價 (⚡ 修正 Yahoo v8 專屬的昨收欄位名稱)
                 price = meta.get('regularMarketPrice', 0)
-                prev_close = meta.get('previousClose', price)
+                prev_close = meta.get('chartPreviousClose', meta.get('previousClose', price))
+                
                 change = price - prev_close
                 change_pct = (change / prev_close * 100) if prev_close > 0 else 0
                 volume = meta.get('regularMarketVolume', 0)
@@ -66,7 +65,7 @@ class handler(BaseHTTPRequestHandler):
                     'volume': volume
                 }
                 
-                # 2. 如果前端有要求 interval，打包 K 線數據
+                # 2. 歷史 K 線數據處理
                 if interval in ['15m', '4h', '1d']:
                     kline_data = []
                     if 'timestamp' in chart_result and 'indicators' in chart_result and 'quote' in chart_result['indicators']:
@@ -90,7 +89,6 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
-            # ⚡ 破壞緩存：強制瀏覽器與邊緣節點不可暫存此 API
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
             self.end_headers()
             self.wfile.write(json.dumps(results).encode('utf-8'))
