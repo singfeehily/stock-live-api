@@ -9,11 +9,12 @@ class handler(BaseHTTPRequestHandler):
         query_components = parse_qs(urlparse(self.path).query)
         symbols_str = query_components.get("symbols", [""])[0]
         
-        # ⚡ 接收前端傳來的新參數：interval (預設為空白，代表只取報價不取 K 線)
+        # 接收前端傳來的新參數：interval
         interval = query_components.get("interval", [""])[0].lower()
         
         if not symbols_str:
             self.send_response(400)
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
             self.end_headers()
             self.wfile.write("請提供股票代號, 例如: ?symbols=AAPL".encode('utf-8'))
             return
@@ -21,17 +22,14 @@ class handler(BaseHTTPRequestHandler):
         results = {}
         symbols = symbols_str.split(',')
         
-        # ⚡ 動態決定 Yahoo API 參數
-        # 如果前端要求 15m 或 4h，我們就拿這幾天的數據。
+        # 動態決定 Yahoo API 參數
         yf_interval = "1d"
         yf_range = "1d"
         
         if interval == '15m':
             yf_interval = "15m"
-            yf_range = "20d"  # 15m 數據我們回溯抓 20 天給圖表
+            yf_range = "20d"  
         elif interval == '4h':
-            # Yahoo Finance 其實不支援原生 4h，通常用 60m 去合成，但為了直接使用，我們支援 60m (1h)
-            # SMC 交易員通常會用 1H 替代 4H 來看盤中結構
             yf_interval = "60m"
             yf_range = "3mo"
         elif interval == '1d':
@@ -43,7 +41,6 @@ class handler(BaseHTTPRequestHandler):
                 sym = sym.strip().upper()
                 if not sym: continue
                 
-                # 呼叫 v8 chart API (現在帶有動態的 interval 和 range)
                 url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range={yf_range}&interval={yf_interval}"
                 
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -55,7 +52,7 @@ class handler(BaseHTTPRequestHandler):
                 chart_result = data['chart']['result'][0]
                 meta = chart_result['meta']
                 
-                # 1. 提取即時報價 (給右側過濾池與熱力圖使用)
+                # 1. 提取即時報價
                 price = meta.get('regularMarketPrice', 0)
                 prev_close = meta.get('previousClose', price)
                 change = price - prev_close
@@ -69,19 +66,16 @@ class handler(BaseHTTPRequestHandler):
                     'volume': volume
                 }
                 
-                # 2. ⚡ 如果前端有要求 interval，我們就順便把 K 線數據打包回去
+                # 2. 如果前端有要求 interval，打包 K 線數據
                 if interval in ['15m', '4h', '1d']:
                     kline_data = []
-                    # 確保 API 有回傳歷史數據
                     if 'timestamp' in chart_result and 'indicators' in chart_result and 'quote' in chart_result['indicators']:
                         timestamps = chart_result['timestamp']
                         quotes = chart_result['indicators']['quote'][0]
                         
                         for i in range(len(timestamps)):
-                            # Yahoo 的數據偶爾會包含 null 值，必須剔除
                             if quotes['open'][i] is not None and quotes['close'][i] is not None:
                                 kline_data.append({
-                                    # Lightweight charts 接受 UNIX timestamp
                                     "time": timestamps[i], 
                                     "open": round(quotes['open'][i], 2),
                                     "high": round(quotes['high'][i], 2),
@@ -89,7 +83,6 @@ class handler(BaseHTTPRequestHandler):
                                     "close": round(quotes['close'][i], 2)
                                 })
                     
-                    # 將這隻股票的真實 K 線放入回傳字典
                     result_item['chart'] = kline_data
                 
                 results[sym] = result_item
@@ -97,6 +90,8 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
+            # ⚡ 破壞緩存：強制瀏覽器與邊緣節點不可暫存此 API
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
             self.end_headers()
             self.wfile.write(json.dumps(results).encode('utf-8'))
             
@@ -104,5 +99,6 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.send_header('Content-type', 'text/plain')
             self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
             self.end_headers()
             self.wfile.write(f"Error fetching data: {str(e)}".encode('utf-8'))
