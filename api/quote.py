@@ -2,11 +2,15 @@ from http.server import BaseHTTPRequestHandler
 import urllib.request
 import json
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         query_components = parse_qs(urlparse(self.path).query)
         symbols_str = query_components.get("symbols", [""])[0]
+        
+        # ⚡ 接收前端傳來的新參數：interval (預設為空白，代表只取報價不取 K 線)
+        interval = query_components.get("interval", [""])[0].lower()
         
         if not symbols_str:
             self.send_response(400)
@@ -17,38 +21,79 @@ class handler(BaseHTTPRequestHandler):
         results = {}
         symbols = symbols_str.split(',')
         
+        # ⚡ 動態決定 Yahoo API 參數
+        # 如果前端要求 15m 或 4h，我們就拿這幾天的數據。
+        yf_interval = "1d"
+        yf_range = "1d"
+        
+        if interval == '15m':
+            yf_interval = "15m"
+            yf_range = "20d"  # 15m 數據我們回溯抓 20 天給圖表
+        elif interval == '4h':
+            # Yahoo Finance 其實不支援原生 4h，通常用 60m 去合成，但為了直接使用，我們支援 60m (1h)
+            # SMC 交易員通常會用 1H 替代 4H 來看盤中結構
+            yf_interval = "60m"
+            yf_range = "3mo"
+        elif interval == '1d':
+            yf_interval = "1d"
+            yf_range = "6mo"
+            
         try:
             for sym in symbols:
                 sym = sym.strip().upper()
                 if not sym: continue
                 
-                # 秘密武器：改用 v8 chart API，完美繞過 Yahoo 的 401 憑證阻擋
-                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
+                # 呼叫 v8 chart API (現在帶有動態的 interval 和 range)
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range={yf_range}&interval={yf_interval}"
                 
-                # 偽裝成真實瀏覽器
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
                 req = urllib.request.Request(url, headers=headers)
                 
                 with urllib.request.urlopen(req) as response:
                     data = json.loads(response.read().decode())
                     
-                # 從圖表元數據 (meta) 中精準提取現價與昨收
-                meta = data['chart']['result'][0]['meta']
+                chart_result = data['chart']['result'][0]
+                meta = chart_result['meta']
+                
+                # 1. 提取即時報價 (給右側過濾池與熱力圖使用)
                 price = meta.get('regularMarketPrice', 0)
                 prev_close = meta.get('previousClose', price)
-                
                 change = price - prev_close
                 change_pct = (change / prev_close * 100) if prev_close > 0 else 0
                 volume = meta.get('regularMarketVolume', 0)
                 
-                results[sym] = {
+                result_item = {
                     'price': round(price, 2),
                     'change': round(change, 2),
                     'change_pct': round(change_pct, 2),
                     'volume': volume
                 }
+                
+                # 2. ⚡ 如果前端有要求 interval，我們就順便把 K 線數據打包回去
+                if interval in ['15m', '4h', '1d']:
+                    kline_data = []
+                    # 確保 API 有回傳歷史數據
+                    if 'timestamp' in chart_result and 'indicators' in chart_result and 'quote' in chart_result['indicators']:
+                        timestamps = chart_result['timestamp']
+                        quotes = chart_result['indicators']['quote'][0]
+                        
+                        for i in range(len(timestamps)):
+                            # Yahoo 的數據偶爾會包含 null 值，必須剔除
+                            if quotes['open'][i] is not None and quotes['close'][i] is not None:
+                                kline_data.append({
+                                    # Lightweight charts 接受 UNIX timestamp
+                                    "time": timestamps[i], 
+                                    "open": round(quotes['open'][i], 2),
+                                    "high": round(quotes['high'][i], 2),
+                                    "low": round(quotes['low'][i], 2),
+                                    "close": round(quotes['close'][i], 2)
+                                })
+                    
+                    # 將這隻股票的真實 K 線放入回傳字典
+                    result_item['chart'] = kline_data
+                
+                results[sym] = result_item
             
-            # 回傳給前端，並允許 Dashboard 跨網域讀取
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
