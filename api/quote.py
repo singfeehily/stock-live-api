@@ -25,29 +25,31 @@ class handler(BaseHTTPRequestHandler):
             for sym in symbols:
                 try:
                     if not interval:
-                        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1m&includePrePost=true"
+                        # [優化] 使用 v7 quote API 專門獲取實時盤前/盤後與精準昨收價
+                        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={sym}"
                         req = urllib.request.Request(url, headers=headers)
                         with urllib.request.urlopen(req) as response:
                             data = json.loads(response.read().decode())
                             
-                        meta = data['chart']['result'][0]['meta']
-                        
-                        reg_price = meta.get('regularMarketPrice', 0)
-                        post_price = meta.get('postMarketPrice')
-                        pre_price = meta.get('preMarketPrice')
-                        
-                        # 固定的基準價：昨天正規市場收盤價 (絕對不能變動)
-                        prev_close = meta.get('chartPreviousClose', meta.get('previousClose', reg_price))
-                        
-                        # 判斷當前有效價格 (盤前 > 盤後 > 常規)
-                        if pre_price:
-                            final_price = pre_price
-                        elif post_price:
-                            final_price = post_price
-                        else:
-                            final_price = reg_price
+                        if not data.get('quoteResponse', {}).get('result'):
+                            continue
                             
-                        # 計算準確的漲跌幅 (現價 - 昨天收盤價)
+                        quote = data['quoteResponse']['result'][0]
+                        
+                        reg_price = quote.get('regularMarketPrice', 0)
+                        pre_price = quote.get('preMarketPrice')
+                        post_price = quote.get('postMarketPrice')
+                        # 絕對基準：昨日常規收盤價
+                        prev_close = quote.get('regularMarketPreviousClose', reg_price)
+                        market_state = quote.get('marketState', 'REGULAR')
+                        
+                        # 智能判斷當前市場狀態並取用對應價格
+                        final_price = reg_price
+                        if market_state in ['PRE', 'PREPRE'] and pre_price:
+                            final_price = pre_price
+                        elif market_state in ['POST', 'POSTPOST', 'CLOSED'] and post_price:
+                            final_price = post_price
+                            
                         change = final_price - prev_close
                         change_pct = (change / prev_close * 100) if prev_close > 0 else 0
                         
@@ -55,10 +57,11 @@ class handler(BaseHTTPRequestHandler):
                             'price': round(final_price, 2),
                             'change': round(change, 2),
                             'change_pct': round(change_pct, 2),
-                            'volume': meta.get('regularMarketVolume', 0)
+                            'volume': quote.get('regularMarketVolume', 0)
                         }
                         
                     else:
+                        # 獲取 K 線圖表數據不變
                         yf_interval, yf_range = "1d", "6mo"
                         if interval == '15m': yf_interval, yf_range = "15m", "20d"  
                         elif interval == '4h': yf_interval, yf_range = "60m", "3mo"
@@ -74,17 +77,13 @@ class handler(BaseHTTPRequestHandler):
                         reg_price = meta.get('regularMarketPrice', 0)
                         post_price = meta.get('postMarketPrice')
                         pre_price = meta.get('preMarketPrice')
-                        
                         prev_close = meta.get('chartPreviousClose', meta.get('previousClose', reg_price))
                         final_price = pre_price if pre_price else (post_price if post_price else reg_price)
                         
-                        change = final_price - prev_close
-                        change_pct = (change / prev_close * 100) if prev_close > 0 else 0
-                        
                         result_item = {
                             'price': round(final_price, 2),
-                            'change': round(change, 2),
-                            'change_pct': round(change_pct, 2),
+                            'change': round(final_price - prev_close, 2),
+                            'change_pct': round(((final_price - prev_close) / prev_close * 100), 2) if prev_close > 0 else 0,
                             'volume': meta.get('regularMarketVolume', 0)
                         }
                         
