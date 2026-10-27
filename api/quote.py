@@ -25,8 +25,6 @@ class handler(BaseHTTPRequestHandler):
             for sym in symbols:
                 try:
                     if not interval:
-                        # ⚡ 模式 1：穩定抓取即時報價 (給 10 秒自動更新用)
-                        # 使用 1d 範圍, 1m K線, 並強制包含盤前/盤後數據 (避開 v7 驗證)
                         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1m&includePrePost=true"
                         req = urllib.request.Request(url, headers=headers)
                         with urllib.request.urlopen(req) as response:
@@ -34,29 +32,22 @@ class handler(BaseHTTPRequestHandler):
                             
                         meta = data['chart']['result'][0]['meta']
                         
-                        # 取得常規、盤前、盤後價格
                         reg_price = meta.get('regularMarketPrice', 0)
                         post_price = meta.get('postMarketPrice')
                         pre_price = meta.get('preMarketPrice')
                         
-                        # 從 1 分鐘 K 線陣列抓取絕對最新的一筆價格 (雙重保險)
-                        latest_k_price = reg_price
-                        try:
-                            quotes = data['chart']['result'][0]['indicators']['quote'][0]
-                            valid_closes = [c for c in quotes.get('close', []) if c is not None]
-                            if valid_closes:
-                                latest_k_price = valid_closes[-1]
-                        except: pass
-
-                        # 判斷最終價格 (盤前 > 盤後 > 最新K線 > 常規收盤)
+                        # 固定的基準價：昨天正規市場收盤價 (絕對不能變動)
+                        prev_close = meta.get('chartPreviousClose', meta.get('previousClose', reg_price))
+                        
+                        # 判斷當前有效價格 (盤前 > 盤後 > 常規)
                         if pre_price:
                             final_price = pre_price
                         elif post_price:
                             final_price = post_price
                         else:
-                            final_price = latest_k_price if latest_k_price > 0 else reg_price
+                            final_price = reg_price
                             
-                        prev_close = meta.get('chartPreviousClose', meta.get('previousClose', reg_price))
+                        # 計算準確的漲跌幅 (現價 - 昨天收盤價)
                         change = final_price - prev_close
                         change_pct = (change / prev_close * 100) if prev_close > 0 else 0
                         
@@ -68,7 +59,6 @@ class handler(BaseHTTPRequestHandler):
                         }
                         
                     else:
-                        # ⚡ 模式 2：抓取 K 線歷史圖表 (給使用者切換週期用)
                         yf_interval, yf_range = "1d", "6mo"
                         if interval == '15m': yf_interval, yf_range = "15m", "20d"  
                         elif interval == '4h': yf_interval, yf_range = "60m", "3mo"
@@ -85,8 +75,8 @@ class handler(BaseHTTPRequestHandler):
                         post_price = meta.get('postMarketPrice')
                         pre_price = meta.get('preMarketPrice')
                         
-                        final_price = pre_price if pre_price else (post_price if post_price else reg_price)
                         prev_close = meta.get('chartPreviousClose', meta.get('previousClose', reg_price))
+                        final_price = pre_price if pre_price else (post_price if post_price else reg_price)
                         
                         change = final_price - prev_close
                         change_pct = (change / prev_close * 100) if prev_close > 0 else 0
@@ -115,8 +105,6 @@ class handler(BaseHTTPRequestHandler):
                         results[sym] = result_item
                 
                 except Exception as inner_e:
-                    # 💡 獨立保護罩：某檔股票抓取失敗，只會印出錯誤，不會中斷整個迴圈
-                    print(f"Error fetching {sym}: {inner_e}")
                     continue
                     
             self.send_response(200)
