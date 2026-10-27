@@ -22,46 +22,47 @@ class handler(BaseHTTPRequestHandler):
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         
         try:
-            for sym in symbols:
+            if not interval:
+                # ⚡ [極速優化] 盤前實時報價：使用批量請求 (Batch Request)，1次請求拿回所有股票，解決超時卡死問題
+                symbols_batch = ",".join(symbols)
+                url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_batch}"
+                req = urllib.request.Request(url, headers=headers)
                 try:
-                    if not interval:
-                        # [優化] 使用 v7 quote API 專門獲取實時盤前/盤後與精準昨收價
-                        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={sym}"
-                        req = urllib.request.Request(url, headers=headers)
-                        with urllib.request.urlopen(req) as response:
-                            data = json.loads(response.read().decode())
+                    with urllib.request.urlopen(req) as response:
+                        data = json.loads(response.read().decode())
+                        
+                    if 'quoteResponse' in data and 'result' in data['quoteResponse']:
+                        for quote in data['quoteResponse']['result']:
+                            sym = quote.get('symbol')
                             
-                        if not data.get('quoteResponse', {}).get('result'):
-                            continue
+                            reg_price = quote.get('regularMarketPrice', 0)
+                            pre_price = quote.get('preMarketPrice')
+                            post_price = quote.get('postMarketPrice')
+                            # 絕對基準：昨日常規收盤價
+                            prev_close = quote.get('regularMarketPreviousClose', reg_price)
+                            market_state = quote.get('marketState', 'REGULAR')
                             
-                        quote = data['quoteResponse']['result'][0]
-                        
-                        reg_price = quote.get('regularMarketPrice', 0)
-                        pre_price = quote.get('preMarketPrice')
-                        post_price = quote.get('postMarketPrice')
-                        # 絕對基準：昨日常規收盤價
-                        prev_close = quote.get('regularMarketPreviousClose', reg_price)
-                        market_state = quote.get('marketState', 'REGULAR')
-                        
-                        # 智能判斷當前市場狀態並取用對應價格
-                        final_price = reg_price
-                        if market_state in ['PRE', 'PREPRE'] and pre_price:
-                            final_price = pre_price
-                        elif market_state in ['POST', 'POSTPOST', 'CLOSED'] and post_price:
-                            final_price = post_price
+                            final_price = reg_price
+                            if market_state in ['PRE', 'PREPRE'] and pre_price:
+                                final_price = pre_price
+                            elif market_state in ['POST', 'POSTPOST', 'CLOSED'] and post_price:
+                                final_price = post_price
+                                
+                            change = final_price - prev_close
+                            change_pct = (change / prev_close * 100) if prev_close > 0 else 0
                             
-                        change = final_price - prev_close
-                        change_pct = (change / prev_close * 100) if prev_close > 0 else 0
-                        
-                        results[sym] = {
-                            'price': round(final_price, 2),
-                            'change': round(change, 2),
-                            'change_pct': round(change_pct, 2),
-                            'volume': quote.get('regularMarketVolume', 0)
-                        }
-                        
-                    else:
-                        # 獲取 K 線圖表數據不變
+                            results[sym] = {
+                                'price': round(final_price, 2),
+                                'change': round(change, 2),
+                                'change_pct': round(change_pct, 2),
+                                'volume': quote.get('regularMarketVolume', 0)
+                            }
+                except Exception as inner_e:
+                    pass
+            else:
+                # K線圖表數據獲取 (點擊單一股票時觸發)
+                for sym in symbols:
+                    try:
                         yf_interval, yf_range = "1d", "6mo"
                         if interval == '15m': yf_interval, yf_range = "15m", "20d"  
                         elif interval == '4h': yf_interval, yf_range = "60m", "3mo"
@@ -102,9 +103,9 @@ class handler(BaseHTTPRequestHandler):
                                     })
                         result_item['chart'] = kline_data
                         results[sym] = result_item
-                
-                except Exception as inner_e:
-                    continue
+                    
+                    except Exception as inner_e:
+                        continue
                     
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
