@@ -22,18 +22,33 @@ def fetch_symbol_data(sym, interval):
         chart_result = data['chart']['result'][0]
         meta = chart_result['meta']
         
-        reg_price = meta.get('regularMarketPrice', 0)
-        # 🚨 保底機制：如果找不到 chartPreviousClose，就用 regularMarketPrice 墊底
-        prev_close = meta.get('chartPreviousClose', meta.get('previousClose', reg_price))
+        # 安全獲取字典數據的函數防呆
+        def safe_get(d, k, default=0):
+            v = d.get(k)
+            return v if v is not None else default
+
+        reg_price = safe_get(meta, 'regularMarketPrice', 0)
+        prev_close = safe_get(meta, 'chartPreviousClose', safe_get(meta, 'previousClose', reg_price))
         
-        last_close = reg_price
+        # 🚨 終極延伸時段 (Pre/Post Market) 追蹤引擎：比對時間戳，永遠只抓最新一筆報價
+        prices = [
+            (safe_get(meta, 'regularMarketTime'), safe_get(meta, 'regularMarketPrice')),
+            (safe_get(meta, 'preMarketTime'), safe_get(meta, 'preMarketPrice')),
+            (safe_get(meta, 'postMarketTime'), safe_get(meta, 'postMarketPrice'))
+        ]
+        # 過濾掉無效資料並依時間戳 (最新到最舊) 排序
+        prices = [p for p in prices if p[0] > 0 and p[1] > 0]
+        prices.sort(key=lambda x: x[0], reverse=True)
+        
+        # 取得絕對最新價格 (盤前、盤中、盤後無縫切換)
+        final_price = prices[0][1] if prices else reg_price
+        
         kline_data = []
-        
         if 'timestamp' in chart_result and 'indicators' in chart_result and 'quote' in chart_result['indicators']:
             timestamps = chart_result['timestamp']
             quotes = chart_result['indicators']['quote'][0]
             
-            # 🚨 極限修復：強制讀取歷史 K 線陣列倒數第二根作為昨收價 (對抗 Yahoo 隱藏數據)
+            # 若為請求日線，強制追溯昨收價，防止漲跌幅 0% 錯誤
             if not interval and len(timestamps) > 1:
                 prev_idx = -2 if quotes['close'][-1] is not None else -3
                 if abs(prev_idx) <= len(quotes['close']):
@@ -41,10 +56,10 @@ def fetch_symbol_data(sym, interval):
                     if fallback_prev is not None and prev_close == reg_price:
                         prev_close = fallback_prev
 
-            for i in range(len(timestamps)):
-                if quotes['open'][i] is not None and quotes['close'][i] is not None:
-                    last_close = quotes['close'][i]
-                    if interval:
+            # 圖表 K 線數據
+            if interval:
+                for i in range(len(timestamps)):
+                    if quotes['open'][i] is not None and quotes['close'][i] is not None:
                         kline_data.append({
                             "time": timestamps[i], 
                             "open": round(quotes['open'][i], 2),
@@ -53,7 +68,6 @@ def fetch_symbol_data(sym, interval):
                             "close": round(quotes['close'][i], 2),
                         })
                         
-        final_price = last_close
         change = final_price - prev_close
         change_pct = (change / prev_close * 100) if prev_close > 0 else 0
         
@@ -61,7 +75,7 @@ def fetch_symbol_data(sym, interval):
             'price': round(final_price, 2),
             'change': round(change, 2),
             'change_pct': round(change_pct, 2),
-            'volume': meta.get('regularMarketVolume', 0)
+            'volume': safe_get(meta, 'regularMarketVolume', 0)
         }
         if interval: res['chart'] = kline_data
         return sym, res
