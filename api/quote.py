@@ -22,8 +22,8 @@ def fetch_symbol_data(sym, interval):
         chart_result = data['chart']['result'][0]
         meta = chart_result['meta']
         
-        # 多重備援提取最新價格與昨收價，確保 % 漲跌幅 100% 正確
         reg_price = meta.get('regularMarketPrice', 0)
+        # 🚨 保底機制：如果找不到 chartPreviousClose，就用 regularMarketPrice 墊底
         prev_close = meta.get('chartPreviousClose', meta.get('previousClose', reg_price))
         
         last_close = reg_price
@@ -33,7 +33,7 @@ def fetch_symbol_data(sym, interval):
             timestamps = chart_result['timestamp']
             quotes = chart_result['indicators']['quote'][0]
             
-            # 針對 5d 查詢，強制提取倒數第二根作為絕對昨收價 (避免 API 回傳缺失)
+            # 🚨 極限修復：強制讀取歷史 K 線陣列倒數第二根作為昨收價 (對抗 Yahoo 隱藏數據)
             if not interval and len(timestamps) > 1:
                 prev_idx = -2 if quotes['close'][-1] is not None else -3
                 if abs(prev_idx) <= len(quotes['close']):
