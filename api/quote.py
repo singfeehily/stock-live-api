@@ -1,10 +1,12 @@
-from http.server import BaseHTTPRequestHandler
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 import urllib.request
 import json
-from urllib.parse import urlparse, parse_qs
 import pandas as pd
 import numpy as np
-from datetime import datetime
+
+app = Flask(__name__)
+CORS(app)  # 🚨 自動解開所有 CORS 跨域封鎖，讓 GitHub Pages 可以順利呼叫！
 
 # 港美股中文名稱對照表
 COMPANY_NAME_MAP = {
@@ -105,7 +107,6 @@ def fetch_symbol_data(sym, interval):
         else:
             current_price = float(regular_price if regular_price > 0 else prev_close)
 
-        # 計算 4H 宏觀結構與 4-Algo 指標
         high_val = float(df['high'].max()) if not df.empty else current_price * 1.05
         low_val = float(df['low'].min()) if not df.empty else current_price * 0.95
         macro_eq = round((high_val + low_val) / 2.0, 2)
@@ -122,7 +123,6 @@ def fetch_symbol_data(sym, interval):
         last_delta = float(df['delta'].iloc[-1]) if not df.empty and 'delta' in df.columns else 0.0
         is_whale = bool(df['is_whale'].iloc[-1]) if not df.empty and 'is_whale' in df.columns else False
 
-        # 整理圖表 K 線陣列供前端 Lightweight Charts 渲染
         chart_array = []
         if not df.empty:
             for _, row in df.iterrows():
@@ -174,25 +174,24 @@ def fetch_symbol_data(sym, interval):
             "chart": []
         }
 
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed_url = urlparse(self.path)
-        query_params = parse_qs(parsed_url.query)
+@app.route('/api/quote', methods=['GET'])
+def quote_endpoint():
+    symbols_str = request.args.get('symbols', 'NVDA')
+    interval = request.args.get('interval', '4h')
+    symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
+    
+    result = {}
+    for sym in symbols:
+        result[sym] = fetch_symbol_data(sym, interval)
         
-        symbols_str = query_params.get('symbols', ['NVDA'])[0]
-        interval = query_params.get('interval', ['4h'])[0]
-        
-        symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
-        result = {}
-        
-        for sym in symbols:
-            result[sym] = fetch_symbol_data(sym, interval)
-            
-        response_body = json.dumps(result).encode('utf-8')
-        
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_headers_safely() if hasattr(self, 'send_headers_safely') else None
-        self.end_headers()
-        self.wfile.write(response_body)
+    return jsonify(result)
+
+@app.route('/api/radar', methods=['GET', 'POST'])
+def radar_endpoint():
+    return jsonify({
+        "status": {"is_running": True, "scan_cursor": 15, "universe_size": 80, "last_scan_symbol": "NVDA", "discovered_count": 1},
+        "discoveries": {}
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
