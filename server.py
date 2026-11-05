@@ -1,8 +1,10 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib.request
+import os
 import socket
+import threading
+import urllib.request
 import json
 import time
 import numpy as np
@@ -32,6 +34,66 @@ RADAR_STATE = {
     "discovered_count": 0
 }
 RADAR_CACHE = {}
+RADAR_STATE["last_data_source"] = None
+RADAR_STATE["last_source_mode"] = None
+
+_radar_scan_lock = threading.Lock()
+
+DATA_OPEND = "FUTU_OPEND"
+DATA_YAHOO = "YAHOO"
+MODE_OPEND = "OPEND"
+MODE_YAHOO = "YAHOO"
+# Pages aborts the Funnel probe of /api/radar after 1200ms.
+RADAR_PROBE_BUDGET_SEC = 0.4
+
+
+def opend_endpoint():
+    """Local OpenD TCP address. An http(s) URL is ignored so the SDK never dials TLS."""
+    host = (os.environ.get('FUTU_HOST') or '127.0.0.1').strip() or '127.0.0.1'
+    if '://' in host or host.lower().startswith('http'):
+        host = '127.0.0.1'
+    raw_port = (os.environ.get('FUTU_PORT') or '11111').strip()
+    try:
+        port = int(raw_port)
+    except ValueError:
+        port = 11111
+    if port < 1 or port > 65535:
+        port = 11111
+    return host, port
+
+
+def feed_labels(used_opend):
+    if used_opend:
+        return {"data_source": DATA_OPEND, "source_mode": MODE_OPEND}
+    return {"data_source": DATA_YAHOO, "source_mode": MODE_YAHOO}
+
+
+def note_served_feed(item):
+    if not item:
+        return
+    RADAR_STATE["last_data_source"] = item.get("data_source")
+    RADAR_STATE["last_source_mode"] = item.get("source_mode")
+
+
+def remember_radar_hit(sym, item):
+    if item.get("status_level") == "executable" or item.get("is_whale"):
+        reason = "金柱巨量買單" if (item.get("is_whale") and item.get("net_delta", 0) > 0) else "機構需求區承接"
+        cached = dict(item)
+        cached["chart"] = []
+        cached["radar_hit"] = True
+        cached["hit_reason"] = reason
+        RADAR_CACHE[sym.upper()] = cached
+
+
+def radar_status_payload(opend_up=None):
+    """OPEND when this process can reach local OpenD, otherwise YAHOO."""
+    if opend_up is None:
+        opend_up = is_local_opend_alive()
+    status = dict(RADAR_STATE)
+    status["discovered_count"] = len(RADAR_CACHE)
+    status.update(feed_labels(opend_up))
+    return status
+
 
 def get_company_name(sym):
     raw = sym.upper().replace('HK.', '').replace('US.', '').replace('.HK', '').strip()
@@ -55,7 +117,11 @@ def get_futu_symbol(sym):
         return f"HK.{s.zfill(5)}"
     return f"US.{s}"
 
-def is_local_opend_alive(host='127.0.0.1', port=11111):
+def is_local_opend_alive(host=None, port=None):
+    if host is None or port is None:
+        default_host, default_port = opend_endpoint()
+        host = default_host if host is None else host
+        port = default_port if port is None else port
     try:
         with socket.create_connection((host, port), timeout=0.25):
             return True
@@ -205,8 +271,9 @@ def evaluate_smc_structure(df, current_price, prev_close):
     }
 
 def try_fetch_from_futu_opend(sym, interval):
-    """第一優先級：若本地 OpenD (127.0.0.1:11111) 在線且安裝了 futu-api，直接提取實時無延遲數據"""
-    if not is_local_opend_alive():
+    """Prefer local OpenD. Return None so the caller can fall back to Yahoo."""
+    host, port = opend_endpoint()
+    if not is_local_opend_alive(host, port):
         return None
     try:
         from futu import OpenQuoteContext, KLType, SubType, RET_OK
@@ -218,9 +285,12 @@ def try_fetch_from_futu_opend(sym, interval):
             '1d': KLType.K_DAY
         }
         kl_type = kl_map.get(interval, KLType.K_60M)
-        quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
+        quote_ctx = OpenQuoteContext(host=host, port=port)
         try:
-            quote_ctx.subscribe([futu_sym], [SubType.QUOTE, kl_type], subscribe_push=False)
+            try:
+                quote_ctx.subscribe([futu_sym], [SubType.QUOTE], subscribe_push=False)
+            except Exception:
+                pass
             ret_q, df_q = quote_ctx.get_market_snapshot([futu_sym])
             ret_k, df_k, _ = quote_ctx.request_history_kline(futu_sym, ktype=kl_type, max_count=200)
             if ret_k != RET_OK or df_k.empty:
@@ -263,17 +333,18 @@ def try_fetch_from_futu_opend(sym, interval):
             return {
                 "symbol": sym.upper(),
                 "company_name": get_company_name(sym),
-                "data_source": "FUTU OPEND (11111 實時直連)",
                 "price": round(current_price, 2),
                 "prev_close": round(prev_close, 2),
                 "change": chg_val,
                 "change_pct": chg_pct,
                 **metrics,
+                **feed_labels(True),
                 "chart": chart_array
             }
         finally:
             quote_ctx.close()
-    except Exception:
+    except Exception as e:
+        print(f"OpenD fetch failed for {sym}: {e}")
         return None
 
 def fetch_symbol_data(sym, interval='4h', include_chart=True):
@@ -282,6 +353,8 @@ def fetch_symbol_data(sym, interval='4h', include_chart=True):
     if opend_res is not None:
         if not include_chart:
             opend_res['chart'] = []
+        remember_radar_hit(sym, opend_res)
+        note_served_feed(opend_res)
         return opend_res
 
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -389,29 +462,60 @@ def fetch_symbol_data(sym, interval='4h', include_chart=True):
         item = {
             "symbol": sym.upper(),
             "company_name": get_company_name(sym),
-            "data_source": "CLOUD PRO (實時補償引擎)",
             "price": round(current_price, 2),
             "prev_close": round(prev_close, 2),
             "change": chg_val,
             "change_pct": chg_pct,
             **metrics,
+            **feed_labels(False),
             "chart": chart_array
         }
-
-        # 自動推入異動雷達池
-        if item.get("status_level") == "executable" or item.get("is_whale"):
-            reason = "金柱巨量買單" if (item.get("is_whale") and item.get("net_delta", 0) > 0) else "機構需求區承接"
-            RADAR_CACHE[sym.upper()] = {**item, "chart": [], "radar_hit": True, "hit_reason": reason}
-
+        remember_radar_hit(sym, item)
+        note_served_feed(item)
         return item
     except Exception as e:
         print(f"Error fetching {sym}: {e}")
-        return {
+        failed = {
             "symbol": sym.upper(),
             "company_name": get_company_name(sym),
+            "data_source": "UNAVAILABLE",
+            "source_mode": "UNAVAILABLE",
             "price": 0.0, "prev_close": 0.0, "change": 0.0, "change_pct": 0.0,
             "chart": []
         }
+        note_served_feed(failed)
+        return failed
+
+def scan_radar_once():
+    if not RADAR_STATE.get('is_running', True):
+        return
+    idx = RADAR_STATE['scan_cursor'] % len(RADAR_UNIVERSE)
+    target_sym = RADAR_UNIVERSE[idx]
+    RADAR_STATE['scan_cursor'] = idx + 1
+    RADAR_STATE['last_scan_symbol'] = target_sym
+    try:
+        fetch_symbol_data(target_sym, interval='4h', include_chart=False)
+    except Exception:
+        pass
+    RADAR_STATE['discovered_count'] = len(RADAR_CACHE)
+
+
+def kick_radar_scan():
+    """Scan off the request thread so a slow OpenD or Yahoo call cannot miss the Funnel probe."""
+    if not _radar_scan_lock.acquire(blocking=False):
+        return None
+    done = threading.Event()
+
+    def _run():
+        try:
+            scan_radar_once()
+        finally:
+            _radar_scan_lock.release()
+            done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return done
+
 
 @app.route('/api/radar', methods=['GET', 'POST'])
 def radar_endpoint():
@@ -419,23 +523,17 @@ def radar_endpoint():
         action = request.args.get('action', '')
         if action == 'toggle':
             RADAR_STATE['is_running'] = not RADAR_STATE['is_running']
-        return jsonify({"ok": True, "status": RADAR_STATE})
+        return jsonify({"ok": True, "status": radar_status_payload()})
 
+    opend_up = is_local_opend_alive()
     if RADAR_STATE['is_running']:
-        idx = RADAR_STATE['scan_cursor'] % len(RADAR_UNIVERSE)
-        target_sym = RADAR_UNIVERSE[idx]
-        RADAR_STATE['scan_cursor'] = idx + 1
-        RADAR_STATE['last_scan_symbol'] = target_sym
-        try:
-            fetch_symbol_data(target_sym, interval='4h', include_chart=False)
-        except Exception:
-            pass
+        done = kick_radar_scan()
+        if done is not None and opend_up:
+            done.wait(timeout=RADAR_PROBE_BUDGET_SEC)
 
-    RADAR_STATE['discovered_count'] = len(RADAR_CACHE)
-    RADAR_STATE['source_mode'] = "LOCAL OPEND (11111 直連)" if is_local_opend_alive() else "CLOUD PRO (雲端雙保底)"
     return jsonify({
-        "status": RADAR_STATE,
-        "discoveries": RADAR_CACHE
+        "status": radar_status_payload(opend_up),
+        "discoveries": dict(RADAR_CACHE)
     })
 
 @app.route('/api/quote', methods=['GET'])
@@ -455,7 +553,13 @@ def quote_endpoint():
             try:
                 result[sym] = future.result()
             except Exception:
-                result[sym] = {"symbol": sym.upper(), "price": 0.0, "chart": []}
+                result[sym] = {
+                    "symbol": sym.upper(),
+                    "price": 0.0,
+                    "chart": [],
+                    "data_source": "UNAVAILABLE",
+                    "source_mode": "UNAVAILABLE"
+                }
 
     return jsonify(result)
 
